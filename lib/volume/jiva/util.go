@@ -258,6 +258,8 @@ func setJivaLblProps(pvc *v1.PersistentVolumeClaim) error {
 	}
 
 	if pvc.Labels[string(v1jiva.JivaFrontEndImageLbl)] == "" {
+		// TODO
+		// Move to constants
 		pvc.Labels[string(v1jiva.JivaFrontEndImageLbl)] = "openebs/jiva:latest"
 	}
 

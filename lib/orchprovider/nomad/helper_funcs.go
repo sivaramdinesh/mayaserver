@@ -131,15 +131,15 @@ func PvcToJob(pvc *v1.PersistentVolumeClaim) (*api.Job, error) {
 	jivaVolName := pvc.Name
 
 	// Set storage size
+	feTaskGroup := "fe" + "-" + jivaGroupName
+	beTaskGroup := "be" + "-" + jivaGroupName
 
-	feTaskGroup := "fe" + jivaGroupName
-	feTaskName := "fe1"
-
-	beTaskGroup1 := "be" + jivaGroupName + "1"
-	beTaskName1 := "be1"
-
-	beTaskGroup2 := "be" + jivaGroupName + "2"
-	beTaskName2 := "be2"
+	// Default storage policy would required 1 FE & 2 BE
+	feTaskName := "fe"
+	//feTaskName1 := "fe1"
+	beTaskName := "be"
+	//beTaskName1 := "be1"
+	//beTaskName2 := "be2"
 
 	jivaFeVersion := pvc.Labels[string(v1jiva.JivaFrontEndImageLbl)]
 	jivaNetworkType := pvc.Labels[string(v1.CNTypeLbl)]
@@ -154,6 +154,47 @@ func PvcToJob(pvc *v1.PersistentVolumeClaim) (*api.Job, error) {
 
 	jivaFeSubnet := pvc.Labels[string(v1.CNSubnetLbl)]
 	jivaFeInterface := pvc.Labels[string(v1.CNInterfaceLbl)]
+
+	// Meta information will be used to:
+	//    1. Persist metadata w.r.t this job
+	//
+	// NOTE:
+	//    This enables to query various info w.r.t job much later.
+	// In addition, job's ENV property can source these metadata by interpreting
+	// them.
+	jobMeta := map[string]string{
+		"targetportal": jivaFeIP + ":" + v1jiva.JivaIscsiTargetPortalPort,
+		"iqn":          v1jiva.JivaIqnFormatPrefix + ":" + jivaVolName,
+	}
+
+	// Jiva FE's ENV among other things interpolates Nomad's built-in properties
+	feEnv := map[string]string{
+		"JIVA_CTL_NAME":    pvc.Name + "-" + feTaskName + "${NOMAD_ALLOC_INDEX}",
+		"JIVA_CTL_VERSION": jivaFeVersion,
+		"JIVA_CTL_VOLNAME": jivaVolName,
+		"JIVA_CTL_VOLSIZE": jivaFEVolSize,
+		"JIVA_CTL_IP":      jivaFeIP,
+		"JIVA_CTL_SUBNET":  jivaFeSubnet,
+		"JIVA_CTL_IFACE":   jivaFeInterface,
+	}
+
+	// Jiva BE's ENV among other things interpolates Nomad's built-in properties
+	beEnv := map[string]string{
+		"NOMAD_ALLOC_INDEX": "${NOMAD_ALLOC_INDEX}",
+		"JIVA_REP_NAME":     pvc.Name + "-" + beTaskName + "${NOMAD_ALLOC_INDEX}",
+		"JIVA_CTL_IP":       jivaFeIP,
+		"JIVA_REP_VOLNAME":  jivaVolName,
+		"JIVA_REP_VOLSIZE":  jivaBEVolSize,
+		"JIVA_REP_VOLSTORE": jivaBEPersistentStor + pvc.Name + "/" + beTaskName + "${NOMAD_ALLOC_INDEX}",
+		"JIVA_REP_VERSION":  jivaFeVersion,
+		"JIVA_REP_NETWORK":  jivaNetworkType,
+		"JIVA_REP_IFACE":    jivaFeInterface,
+		// Group count index is suffixed in the property name
+		"JIVA_REP_IP_0": jivaBeIP1,
+		// Group count index is suffixed in the property name
+		"JIVA_REP_IP_1":   jivaBeIP2,
+		"JIVA_REP_SUBNET": jivaFeSubnet,
+	}
 
 	// TODO
 	// Transformation from pvc or pv to nomad types & vice-versa:
@@ -178,12 +219,7 @@ func PvcToJob(pvc *v1.PersistentVolumeClaim) (*api.Job, error) {
 		Constraints: []*api.Constraint{
 			api.NewConstraint("${attr.kernel.name}", "=", "linux"),
 		},
-		// Meta information will be used to pass on the metadata from
-		// nomad to clients of mayaserver.
-		Meta: map[string]string{
-			"targetportal": jivaFeIP + ":" + v1jiva.JivaIscsiTargetPortalPort,
-			"iqn":          v1jiva.JivaIqnFormatPrefix + ":" + jivaVolName,
-		},
+		Meta: jobMeta,
 		TaskGroups: []*api.TaskGroup{
 			// jiva frontend
 			&api.TaskGroup{
@@ -197,26 +233,18 @@ func PvcToJob(pvc *v1.PersistentVolumeClaim) (*api.Job, error) {
 				},
 				Tasks: []*api.Task{
 					&api.Task{
-						Name:   feTaskName,
+						Name:   feTaskName + "${NOMAD_ALLOC_INDEX}",
 						Driver: "raw_exec",
 						Resources: &api.Resources{
-							CPU:      helper.IntToPtr(500),
-							MemoryMB: helper.IntToPtr(256),
+							CPU:      helper.IntToPtr(50),
+							MemoryMB: helper.IntToPtr(50),
 							Networks: []*api.NetworkResource{
 								&api.NetworkResource{
-									MBits: helper.IntToPtr(400),
+									MBits: helper.IntToPtr(50),
 								},
 							},
 						},
-						Env: map[string]string{
-							"JIVA_CTL_NAME":    pvc.Name + "-" + feTaskGroup + "-" + feTaskName,
-							"JIVA_CTL_VERSION": jivaFeVersion,
-							"JIVA_CTL_VOLNAME": jivaVolName,
-							"JIVA_CTL_VOLSIZE": jivaFEVolSize,
-							"JIVA_CTL_IP":      jivaFeIP,
-							"JIVA_CTL_SUBNET":  jivaFeSubnet,
-							"JIVA_CTL_IFACE":   jivaFeInterface,
-						},
+						Env: feEnv,
 						Artifacts: []*api.TaskArtifact{
 							&api.TaskArtifact{
 								GetterSource: helper.StringToPtr("https://raw.githubusercontent.com/openebs/jiva/master/scripts/launch-jiva-ctl-with-ip"),
@@ -233,92 +261,37 @@ func PvcToJob(pvc *v1.PersistentVolumeClaim) (*api.Job, error) {
 					},
 				},
 			},
-			// jiva replica 1
+			// jiva replica group
 			&api.TaskGroup{
-				Name:  helper.StringToPtr(beTaskGroup1),
-				Count: helper.IntToPtr(1),
+				Name: helper.StringToPtr(beTaskGroup),
+				// Replica count
+				Count: helper.IntToPtr(2),
+				// We want the replicas to spread across hosts
+				// This ensures high availability
+				Constraints: []*api.Constraint{
+					api.NewConstraint("", "distinct_hosts", "true"),
+				},
 				RestartPolicy: &api.RestartPolicy{
 					Attempts: helper.IntToPtr(3),
 					Interval: helper.TimeToPtr(5 * time.Minute),
 					Delay:    helper.TimeToPtr(25 * time.Second),
 					Mode:     helper.StringToPtr("delay"),
 				},
+				// This has multiple replicas as tasks
 				Tasks: []*api.Task{
 					&api.Task{
-						Name:   beTaskName1,
+						Name:   beTaskName + "${NOMAD_ALLOC_INDEX}",
 						Driver: "raw_exec",
 						Resources: &api.Resources{
-							CPU:      helper.IntToPtr(500),
-							MemoryMB: helper.IntToPtr(256),
+							CPU:      helper.IntToPtr(50),
+							MemoryMB: helper.IntToPtr(50),
 							Networks: []*api.NetworkResource{
 								&api.NetworkResource{
-									MBits: helper.IntToPtr(400),
+									MBits: helper.IntToPtr(50),
 								},
 							},
 						},
-						Env: map[string]string{
-							"JIVA_REP_NAME":     pvc.Name + "-" + beTaskGroup1 + "-" + beTaskName1,
-							"JIVA_CTL_IP":       jivaFeIP,
-							"JIVA_REP_VOLNAME":  jivaVolName,
-							"JIVA_REP_VOLSIZE":  jivaBEVolSize,
-							"JIVA_REP_VOLSTORE": jivaBEPersistentStor + pvc.Name + "-" + beTaskGroup1 + "/" + beTaskName1,
-							"JIVA_REP_VERSION":  jivaFeVersion,
-							"JIVA_REP_NETWORK":  jivaNetworkType,
-							"JIVA_REP_IFACE":    jivaFeInterface,
-							"JIVA_REP_IP":       jivaBeIP1,
-							"JIVA_REP_SUBNET":   jivaFeSubnet,
-						},
-						Artifacts: []*api.TaskArtifact{
-							&api.TaskArtifact{
-								GetterSource: helper.StringToPtr("https://raw.githubusercontent.com/openebs/jiva/master/scripts/launch-jiva-rep-with-ip"),
-								RelativeDest: helper.StringToPtr("local/"),
-							},
-						},
-						Config: map[string]interface{}{
-							"command": "launch-jiva-rep-with-ip",
-						},
-						LogConfig: &api.LogConfig{
-							MaxFiles:      helper.IntToPtr(3),
-							MaxFileSizeMB: helper.IntToPtr(1),
-						},
-					},
-				},
-			},
-			// jiva replica 2
-			&api.TaskGroup{
-				Name:  helper.StringToPtr(beTaskGroup2),
-				Count: helper.IntToPtr(1),
-				RestartPolicy: &api.RestartPolicy{
-					Attempts: helper.IntToPtr(3),
-					Interval: helper.TimeToPtr(5 * time.Minute),
-					Delay:    helper.TimeToPtr(25 * time.Second),
-					Mode:     helper.StringToPtr("delay"),
-				},
-				Tasks: []*api.Task{
-					&api.Task{
-						Name:   beTaskName2,
-						Driver: "raw_exec",
-						Resources: &api.Resources{
-							CPU:      helper.IntToPtr(500),
-							MemoryMB: helper.IntToPtr(256),
-							Networks: []*api.NetworkResource{
-								&api.NetworkResource{
-									MBits: helper.IntToPtr(400),
-								},
-							},
-						},
-						Env: map[string]string{
-							"JIVA_REP_NAME":     pvc.Name + "-" + beTaskGroup2 + "-" + beTaskName2,
-							"JIVA_CTL_IP":       jivaFeIP,
-							"JIVA_REP_VOLNAME":  jivaVolName,
-							"JIVA_REP_VOLSIZE":  jivaBEVolSize,
-							"JIVA_REP_VOLSTORE": jivaBEPersistentStor + pvc.Name + "-" + beTaskGroup2 + "/" + beTaskName2,
-							"JIVA_REP_VERSION":  jivaFeVersion,
-							"JIVA_REP_NETWORK":  jivaNetworkType,
-							"JIVA_REP_IFACE":    jivaFeInterface,
-							"JIVA_REP_IP":       jivaBeIP2,
-							"JIVA_REP_SUBNET":   jivaFeSubnet,
-						},
+						Env: beEnv,
 						Artifacts: []*api.TaskArtifact{
 							&api.TaskArtifact{
 								GetterSource: helper.StringToPtr("https://raw.githubusercontent.com/openebs/jiva/master/scripts/launch-jiva-rep-with-ip"),
@@ -421,6 +394,7 @@ func JobToPv(job *api.Job) (*v1.PersistentVolume, error) {
 	pv.Status = pvs
 
 	if *job.Status == structs.JobStatusRunning {
+		// Remember we use the job's metadata to persist metadata w.r.t the job
 		pv.Annotations = job.Meta
 	}
 
